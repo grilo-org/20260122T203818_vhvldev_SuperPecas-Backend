@@ -1,0 +1,126 @@
+
+name: Grilo SC Analysis for Java (Maven/Gradle)
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  workflow_dispatch: {}
+
+jobs:
+  sonar-analysis:
+    name: SonarCloud Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # DETECÇÃO INTELIGENTE
+      - name: Detect Project Type and Java Version
+        id: project_info
+        run: |
+          # 1. Procura Maven
+          POM_PATH=$(find . -maxdepth 3 -name "pom.xml" -not -path "*/target/*" | head -n 1)
+          
+          # 2. Procura Gradle
+          GRADLE_PATH=$(find . -maxdepth 3 -name "gradlew" -o -name "build.gradle" -o -name "build.gradle.kts" | head -n 1)
+
+          if [ -n "$POM_PATH" ]; then
+            echo "Build System: Maven detected at $POM_PATH"
+            echo "build_system=maven" >> $GITHUB_OUTPUT
+            echo "build_file=$POM_PATH" >> $GITHUB_OUTPUT
+            JAVA_VERSION=$(mvn -q -Dexec.executable=echo -Dexec.args='${maven.compiler.release}' --non-recursive exec:exec -f "$POM_PATH" | grep -o '^[0-9][0-9]*' || echo '17')
+          
+          elif [ -n "$GRADLE_PATH" ]; then
+            echo "Build System: Gradle detected at $GRADLE_PATH"
+            echo "build_system=gradle" >> $GITHUB_OUTPUT
+            if [[ "$GRADLE_PATH" == *"gradlew"* ]]; then
+               DIR=$(dirname "$GRADLE_PATH")
+               echo "gradle_wrapper_dir=$DIR" >> $GITHUB_OUTPUT
+            fi
+            JAVA_VERSION='17'
+          else
+             echo "::warning::Nenhum build system detectado."
+             echo "build_system=unknown" >> $GITHUB_OUTPUT
+             JAVA_VERSION='17'
+          fi
+          
+          echo "Java Version Selected: $JAVA_VERSION"
+          echo "java_version=$JAVA_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ steps.project_info.outputs.java_version }}
+          distribution: 'temurin'
+
+      # --- EXECUÇÃO MAVEN ---
+      - name: Maven Analysis (Full)
+        if: steps.project_info.outputs.build_system == 'maven'
+        id: maven_full
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -f ${{ steps.project_info.outputs.build_file }} -Dsonar.projectKey=grilo-org_20260122T203818_vhvldev_SuperPecas-Backend -Dsonar.projectName=20260122T203818_vhvldev_SuperPecas-Backend -Dsonar.host.url=https://sonarcloud.io -Dsonar.organization=grilo-org
+
+      - name: Maven Analysis (Fallback)
+        if: steps.project_info.outputs.build_system == 'maven' && steps.maven_full.outcome == 'failure'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          echo "::warning::Build Maven falhou. Tentando sem testes."
+          mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -Dmaven.test.skip=true -f ${{ steps.project_info.outputs.build_file }} -Dsonar.projectKey=grilo-org_20260122T203818_vhvldev_SuperPecas-Backend -Dsonar.projectName=20260122T203818_vhvldev_SuperPecas-Backend -Dsonar.host.url=https://sonarcloud.io -Dsonar.organization=grilo-org
+
+      # --- EXECUÇÃO GRADLE (SUPER BLINDADA) ---
+      
+      # 1. TENTA COMPILAR (Smart Build: Debug > Release)
+      - name: Gradle Build (Smart Strategy)
+        if: steps.project_info.outputs.build_system == 'gradle'
+        id: gradle_build
+        continue-on-error: true
+        run: |
+          if [ -n "${{ steps.project_info.outputs.gradle_wrapper_dir }}" ]; then
+            cd ${{ steps.project_info.outputs.gradle_wrapper_dir }}
+            chmod +x gradlew
+            # Tenta assembleDebug (Android) primeiro. Se falhar (ex: task não existe em Java puro), tenta assemble.
+            ./gradlew assembleDebug --no-daemon || ./gradlew assemble --no-daemon
+          else
+            gradle assembleDebug --no-daemon || gradle assemble --no-daemon
+          fi
+          
+      # 2. FALLBACK DE COMPILAÇÃO (Rescue Mode)
+      - name: Gradle Build (Rescue)
+        if: steps.project_info.outputs.build_system == 'gradle' && steps.gradle_build.outcome == 'failure'
+        run: |
+           echo "::warning::Build Full falhou. Iniciando modo de resgate agressivo."
+           if [ -n "${{ steps.project_info.outputs.gradle_wrapper_dir }}" ]; then
+            cd ${{ steps.project_info.outputs.gradle_wrapper_dir }}
+            # Tenta Debug sem testes/lint (Android). Se falhar, tenta assemble genérico sem testes/lint.
+            ./gradlew assembleDebug -x test -x lint --no-daemon || ./gradlew assemble -x test -x lint --no-daemon
+           else
+            gradle assembleDebug -x test -x lint --no-daemon || gradle assemble -x test -x lint --no-daemon
+           fi
+
+      # 3. ANÁLISE SONAR
+      # Nota: Adicionei caminhos extras em 'sonar.java.binaries' para garantir que ele ache as classes
+      # tanto em projetos Java Padrão (build/classes) quanto Android (intermediates/javac/debug).
+      - name: SonarCloud Scan (Gradle Strategy)
+        if: steps.project_info.outputs.build_system == 'gradle'
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=grilo-org_20260122T203818_vhvldev_SuperPecas-Backend
+            -Dsonar.projectName=20260122T203818_vhvldev_SuperPecas-Backend
+            -Dsonar.organization=grilo-org
+            -Dsonar.java.binaries=**/build/classes,**/build/intermediates/javac,**/build/tmp/kotlin-classes
+            -Dsonar.sources=.
+            -Dsonar.tests=.
+            -Dsonar.test.inclusions=**/*Test.java,**/*Tests.java
+            -Dsonar.exclusions=**/*.class
